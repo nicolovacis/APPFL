@@ -25,3 +25,8 @@ from .server_fed_compass_mom import *
 from .server_fed_compass_nova import *
 from .scheduler_compass import *
 from .scheduler_dummy import *
+
+from .server_fedavg_sgd import FedAvgSGD
+from .server_fedavg_ass import FedAvgASS
+from .server_fedgm_sgd import FedGMSGD
+from .server_fedgm_ass import FedGMASS
