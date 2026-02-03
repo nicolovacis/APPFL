@@ -9,10 +9,6 @@ Key insight from Miaolan: Each client does SASS iterations. The stepsize rule:
 - If iteration is SUCCESSFUL (passes Armijo condition) → stepsize INCREASES
 - If iteration is UNSUCCESSFUL (fails Armijo condition) → stepsize DECREASES
 
-This is the opposite logic from Algorithm 1! Here:
-- SELECTED = successful = INCREASE stepsize (be more aggressive)
-- REJECTED = unsuccessful = DECREASE stepsize (be more conservative)
-
 Reference: Jin, Scheinberg, Xie (2021) - "High probability complexity bounds 
 for adaptive step search based on stochastic oracles"
 """
