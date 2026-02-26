@@ -32,8 +32,26 @@ class FedAvgASS(AdaptiveMixin, AveragingMixin, ServerFedAvg):
         # where new_global_state is already the updated model (wᵏ⁺¹)
         aggregated_states, selected_clients, lr_clients = self.select_clients_and_states(local_states)
         
+        """
         # Extract the single aggregated state
         self.global_state = aggregated_states[0]
+        self.model.load_state_dict(self.global_state)
+        """
+
+        #my fix: compute avg calling the averaging mixin on the selected clients' states
+        #ClientAdaptOptim.update return a dict like this: 
+        """
+            "primal_state": self.primal_state,
+            "grad_estimate": self.grad_estimate,
+            "function_value_difference": self.function_value_difference
+        }
+        """
+        #in run_serial_adapt before calling server.update we add each client state to the local_state list
+        #so local_states is a list of dicts, each dict has the keys "primal_state", "grad_estimate", "function_value_difference"
+        #aggregate models requires a list of STATEDICT
+        #so we need to extract the "primal_state" from each client state and pass it to aggregate_models
+        primal_states = [client_state["primal_state"] for client_state in local_states]
+        self.global_state = self.aggregate_models(primal_states,selected_clients)
         self.model.load_state_dict(self.global_state)
         
         return self.global_state, lr_clients

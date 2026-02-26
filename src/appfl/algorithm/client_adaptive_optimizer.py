@@ -176,7 +176,8 @@ class ClientAdaptOptim(BaseClient):
         for name, param in self.model.named_parameters():
             # gradient for each parameter
             # self.grad_estimate[name] = (initial_model_state[name] - param.data) / learning_rate
-            self.grad_estimate[name] = param.grad
+            if param.grad is not None:
+                self.grad_estimate[name] = param.grad
 
         # Final loss computation
         final_loss = 0

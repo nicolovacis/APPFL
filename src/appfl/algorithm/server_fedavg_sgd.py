@@ -13,7 +13,11 @@ class FedAvgSGD(SGDMixin, AveragingMixin, ServerFedAvg):
 
     def update(self, local_states: List[Any]) -> Tuple[StateDict, Optional[Dict[int, float]]]:
         client_states, selected_clients, lr_clients = self.select_clients_and_states(local_states)
-        aggregated = self.aggregate_models(client_states, selected_clients)
+        #aggregated = self.aggregate_models(client_states, selected_clients)
+
+        #even here i exttract primal states from local_states
+        primal_states = [state['primal_state'] for state in client_states]
+        aggregated = self.aggregate_models(primal_states, selected_clients)
 
         self.global_state = aggregated
         self.model.load_state_dict(self.global_state)
