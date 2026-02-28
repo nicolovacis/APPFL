@@ -3,137 +3,165 @@ import copy
 import time
 import torch
 import numpy as np
-from torch.optim import *
 from .fl_base import BaseClient
-from collections import OrderedDict
+from .step_size_mixins import (
+    check_armijo_conditions_nls,
+    try_sgd_update,
+    compute_grad_norm,
+    random_seed_torch,
+)
+
 
 class ClientAdaptOptim(BaseClient):
-    """This client optimizer performs updates for a certain number of epochs in each training round."""
-    def __init__(self, id, weight, model, loss_fn, dataloader, cfg, outfile, test_dataloader, metric, **kwargs):
-        super(ClientAdaptOptim, self).__init__(id, weight, model, loss_fn, dataloader, cfg, outfile, test_dataloader, metric)
+    """Client with local SASS (Stochastic Armijo Step Search) optimisation.
+
+    Each communication round the client:
+      1. Loads the global model sent by the server.
+      2. Resets the step-size to ``server_lr`` (the configured starting LR).
+      3. Runs ``num_local_epochs`` epochs over its local data; every
+         *mini-batch* is one SASS step (tentative SGD update → Armijo
+         check → accept / reject + step-size adjustment).
+      4. Returns its updated model weights (state dict) to the server.
+
+    SASS semantics are identical to the centralized reference in
+    ``Sass/sass.py`` + ``Sass/utils.py``.
+    """
+
+    def __init__(self, id, weight, model, loss_fn, dataloader, cfg, outfile,
+                 test_dataloader, metric, **kwargs):
+        super(ClientAdaptOptim, self).__init__(
+            id, weight, model, loss_fn, dataloader, cfg, outfile,
+            test_dataloader, metric,
+        )
         self.__dict__.update(kwargs)
-        
-        if hasattr(self, 'outfile') and self.outfile:
+
+        # ── SASS hyper-parameters (arrive via cfg.fed.args / kwargs) ────
+        # Provide safe defaults so the client works even when a param is
+        # missing from the config (e.g. theta was not set before this
+        # refactor).
+        if not hasattr(self, "server_lr"):
+            self.server_lr = 0.01
+        if not hasattr(self, "gamma"):       # gamma_incr
+            self.gamma = 1.25
+        if not hasattr(self, "gamma_decr"):
+            self.gamma_decr = 0.7
+        if not hasattr(self, "theta"):
+            self.theta = 0.2
+        if not hasattr(self, "eps_f"):
+            self.eps_f = 0.0
+        if not hasattr(self, "max_lr"):
+            self.max_lr = 10.0
+        if not hasattr(self, "min_lr"):
+            self.min_lr = 1e-8
+
+        if hasattr(self, "outfile") and self.outfile:
             self.client_log_title()
 
+    # ── Logging ─────────────────────────────────────────────────────────
+
     def client_log_title(self):
-        # 扩展标题以包括 LearningRate 和 GradNorm
         title = "%10s %10s %10s %10s %10s %10s %10s %10s %10s %10s\n" % (
-            "Round",
-            "LocalEpoch",
-            "PerIter[s]",
-            "TrainLoss",
-            "TrainAccu",
-            "TestLoss",
-            "TestAccu",
-            "LearningRate",
-            "GradNorm",
-            "ValueCheck"
+            "Round", "LocalEpoch", "PerIter[s]",
+            "TrainLoss", "TrainAccu",
+            "TestLoss", "TestAccu",
+            "StepSize", "AcceptRate", "GradNorm",
         )
         self.outfile.write(title)
         self.outfile.flush()
 
     def client_log_content(
-        self, t, per_iter_time, train_loss, train_accuracy, test_loss, test_accuracy, learning_rate, grad_norm, value_check
+        self, t, per_iter_time, train_loss, train_accuracy,
+        test_loss, test_accuracy, step_size, accept_rate, grad_norm,
     ):
-        # 扩展内容格式，以记录 LearningRate 和 GradNorm
         contents = "%10s %10s %10.2f %10.4f %10.4f %10.4f %10.4f %10.6f %10.4f %10.4f\n" % (
-            self.round,
-            t,
-            per_iter_time,
-            train_loss,
-            train_accuracy,
-            test_loss,
-            test_accuracy,
-            learning_rate,
-            grad_norm,
-            value_check
+            self.round, t, per_iter_time,
+            train_loss, train_accuracy,
+            test_loss, test_accuracy,
+            step_size, accept_rate, grad_norm,
         )
         self.outfile.write(contents)
         self.outfile.flush()
 
-    def update(self, global_model, learning_rate):
-        #print(f"Client {self.id} received learning rate: {learning_rate}")
-        """
-        Perform local updates using the provided global model and learning rate.
-        Args:
-            global_model: The global model parameters received from the server.
-            learning_rate: The learning rate provided by the server.
-        """
-        # Load the global model weights
+    # ── Local SASS training ─────────────────────────────────────────────
+
+    def update(self, global_model):
+        """Run local SASS epochs and return the updated model state dict."""
         self.model.load_state_dict(global_model)
-        # learning rate from server
-        self.optim_args["lr"] = learning_rate
         self.model.to(self.cfg.device)
-        optimizer = eval(self.optim)(self.model.parameters(), **self.optim_args)
-        #print(f"Client {self.id} optimizer learning rate: {optimizer.param_groups[0]['lr']}")  # Print optimizer LR for verification
-        initial_model_state = copy.deepcopy(self.model.state_dict())  # Save initial state for gradient estimate
 
-        # Compute the initial loss
-        initial_loss = 0
-        with torch.no_grad():
-            for data, target in self.dataloader:
-                data = data.to(self.cfg.device)
-                target = target.to(self.cfg.device)
-                output = self.model(data)
-                loss = self.loss_fn(output, target)
-                initial_loss += loss.item()
-        initial_loss /= len(self.dataloader)
+        # Reset step-size at the beginning of every round (requirement #7)
+        step_size = float(self.server_lr)
 
-        # Calculate initial gradient norm
-        gradient_norm = 0
-        for data, target in self.dataloader:
-            data = data.to(self.cfg.device)
-            target = target.to(self.cfg.device)
-            optimizer.zero_grad()
-            output = self.model(data)
-            loss = self.loss_fn(output, target)
-            loss.backward()
-            gradient_norm += torch.norm(
-                torch.cat([param.grad.view(-1) for param in self.model.parameters() if param.grad is not None])
-            ).item()
-        gradient_norm /= len(self.dataloader)  # Compute average gradient norm
-
-        # Initial evaluation with value_check calculation
-        function_value_difference = initial_loss
-        value_check = function_value_difference + learning_rate * (gradient_norm ** 2)
-
-        # Log initial values
-        self.client_log_content(0, 0, initial_loss, 0, 0, 0, learning_rate, gradient_norm, value_check)
-
-        # Local training
         for t in range(self.num_local_epochs):
             start_time = time.time()
-            train_loss, target_true, target_pred = 0, [], []
+            train_loss = 0.0
+            target_true, target_pred = [], []
+            n_batches = 0
+            n_accepted = 0
+            epoch_grad_norm = 0.0
+
             for data, target in self.dataloader:
                 data = data.to(self.cfg.device)
                 target = target.to(self.cfg.device)
-                optimizer.zero_grad()
-                output = self.model(data)  # Forward pass
-                loss = self.loss_fn(output, target)  # Compute loss
+                n_batches += 1
+
+                # ── deterministic seed (same as centralized sass.py) ──
+                seed = int(time.time())
+
+                # 1. Forward + backward with deterministic seed
+                self.model.zero_grad()
+                with random_seed_torch(seed):
+                    output = self.model(data)
+                    loss = self.loss_fn(output, target)
                 loss.backward()
 
-                # 计算梯度范数
-                gradient_norm = torch.norm(
-                    torch.cat([param.grad.view(-1) for param in self.model.parameters() if param.grad is not None])
-                ).item()
+                # 2. Snapshot current parameters and gradients
+                params = list(self.model.parameters())
+                params_current = [p.data.clone() for p in params]
+                grad_current = [
+                    p.grad.clone() if p.grad is not None
+                    else torch.zeros_like(p)
+                    for p in params
+                ]
 
-                optimizer.step()
+                grad_norm = compute_grad_norm(grad_current)
+                epoch_grad_norm += grad_norm.item()
 
+                with torch.no_grad():
+                    # 3. Tentative SGD step
+                    try_sgd_update(params, step_size, params_current,
+                                   grad_current)
+
+                    # 4. Loss at tentative point (deterministic, same batch)
+                    with random_seed_torch(seed):
+                        output_next = self.model(data)
+                        loss_next = self.loss_fn(output_next, target)
+
+                    # 5. Armijo condition (faithful to centralized utils.py)
+                    success = check_armijo_conditions_nls(
+                        step_size=step_size,
+                        loss=loss,
+                        grad_norm=grad_norm,
+                        loss_next=loss_next,
+                        theta=self.theta,
+                        eps_f=self.eps_f,
+                    )
+
+                    if success:
+                        # Accept step; increase step-size
+                        step_size = min(step_size * self.gamma, self.max_lr)
+                        n_accepted += 1
+                    else:
+                        # Reject step; decrease step-size and restore params
+                        step_size = max(step_size * self.gamma_decr,
+                                        self.min_lr)
+                        for p, pc in zip(params, params_current):
+                            p.data = pc
+
+                # Accumulate metrics (use the *accepted* loss for logging)
+                train_loss += loss.item()
                 target_true.append(target.detach().cpu().numpy())
                 target_pred.append(output.detach().cpu().numpy())
-                train_loss += loss.item()
-
-                # Compute the real gradient norm for this batch
-                # total_grad_norm = 0.0
-                # batch_grad_norm = 0.0
-                # for param in self.model.parameters():
-                #     if param.grad is not None:
-                #         batch_grad_norm += param.grad.norm(2).item() ** 2  # L2 norm squared for each parameter
-                # batch_grad_norm = batch_grad_norm ** 0.5  # Take the square root to get the final gradient norm
-                
-                # total_grad_norm += batch_grad_norm
-                # print("the real gradient values: ",total_grad_norm )
 
                 if self.clip_grad or self.use_dp:
                     torch.nn.utils.clip_grad_norm_(
@@ -142,73 +170,51 @@ class ClientAdaptOptim(BaseClient):
                         norm_type=self.clip_norm,
                     )
 
-            train_loss /= len(self.dataloader)
-            # print(f"Client {self.id} Epoch {t} Average Training Loss: {train_loss}")  # Print average loss for each epoch
-            target_true, target_pred = np.concatenate(target_true), np.concatenate(target_pred)
+            train_loss /= max(n_batches, 1)
+            accept_rate = n_accepted / max(n_batches, 1)
+            avg_grad_norm = epoch_grad_norm / max(n_batches, 1)
+
+            target_true = np.concatenate(target_true)
+            target_pred = np.concatenate(target_pred)
             train_accuracy = float(self.metric(target_true, target_pred))
 
             # Validation
             if self.cfg.validation and self.test_dataloader is not None:
-                test_loss, test_accuracy = super(ClientAdaptOptim, self).client_validation()
+                test_loss, test_accuracy = super(
+                    ClientAdaptOptim, self
+                ).client_validation()
             else:
                 test_loss, test_accuracy = 0, 0
 
             per_iter_time = time.time() - start_time
 
-            # Calculate value_check based on current epoch's data
-            function_value_difference = train_loss - initial_loss
-            value_check = function_value_difference + learning_rate * (gradient_norm ** 2)
+            self.client_log_content(
+                t + 1, per_iter_time, train_loss, train_accuracy,
+                test_loss, test_accuracy, step_size, accept_rate,
+                avg_grad_norm,
+            )
 
-            # Log values for each epoch
-            self.client_log_content(t + 1, per_iter_time, train_loss, train_accuracy, test_loss, test_accuracy, learning_rate, gradient_norm, value_check)
-
-            # Save model.state_dict()
+            # Save model state dict if requested
             if self.cfg.save_model_state_dict:
                 path = self.cfg.output_dirname + f"/client_{self.id}"
                 if not os.path.exists(path):
                     os.makedirs(path, exist_ok=True)
-                torch.save(self.model.state_dict(), os.path.join(path, f"{self.round}_{t}.pt"))
+                torch.save(
+                    self.model.state_dict(),
+                    os.path.join(path, f"{self.round}_{t}.pt"),
+                )
 
         self.round += 1
 
-        # Compute gradient estimate
-        self.grad_estimate = OrderedDict()
-        for name, param in self.model.named_parameters():
-            # gradient for each parameter
-            # self.grad_estimate[name] = (initial_model_state[name] - param.data) / learning_rate
-            if param.grad is not None:
-                self.grad_estimate[name] = param.grad
-
-        # Final loss computation
-        final_loss = 0
-        with torch.no_grad():
-            for data, target in self.dataloader:
-                data = data.to(self.cfg.device)
-                target = target.to(self.cfg.device)
-                output = self.model(data)
-                loss = self.loss_fn(output, target)
-                final_loss += loss.item()
-        final_loss /= len(self.dataloader)
-
-        self.function_value_difference = final_loss - initial_loss
-
-        # client selection criteria check: 
-        value_check = self.function_value_difference + learning_rate* (gradient_norm**2)
-
-        # Differential Privacy
+        # ── Prepare return value: plain state dict (weights only) ───────
         self.primal_state = copy.deepcopy(self.model.state_dict())
+
+        # Differential privacy (if configured)
         if self.use_dp:
-            sensitivity = 2.0 * self.clip_value * self.optim_args['lr']
+            sensitivity = 2.0 * self.clip_value * step_size
             scale_value = sensitivity / self.epsilon
-            super(ClientAdaptOptim, self).laplace_mechanism_output_perturb(scale_value)
+            super(ClientAdaptOptim, self).laplace_mechanism_output_perturb(
+                scale_value
+            )
 
-        # Move model parameters to CPU for communication
-        # if self.cfg.device == "cuda":
-        #     for k in self.primal_state:
-        #         self.primal_state[k] = self.primal_state[k].cpu()
-
-        return {
-            "primal_state": self.primal_state,
-            "grad_estimate": self.grad_estimate,
-            "function_value_difference": self.function_value_difference
-        }
+        return self.primal_state

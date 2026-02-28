@@ -55,10 +55,7 @@ def run_serial(
     for k in range(cfg.num_clients):
         weights[k] = len(train_data[k]) / total_num_data
 
-    ## Client learning rates      
-    lr_clients= {}
-    for k in range(cfg.num_clients):
-        lr_clients[k] = cfg.fed.args.optim_args.lr
+    ## (SASS step-sizes are managed locally by each client — no server-side lr_clients)
 
     ## Run validation if test data is given or the configuration is enabled
     test_dataloader = None
@@ -118,7 +115,7 @@ def run_serial(
     for t in range(cfg.num_epochs):
         per_iter_start = time.time()
         local_states = []
-        server.model.to("cuda")
+        server.model.to(cfg.device_server)
  
         global_state = server.model.state_dict()
         if cfg.personalization:
@@ -132,22 +129,16 @@ def run_serial(
         
         for k, client in enumerate(clients):
             if cfg.personalization:
-                client.model.load_state_dict(global_state,strict=False)
+                client.model.load_state_dict(global_state, strict=False)
             else:
-                client.model.load_state_dict(global_state)            
-            ################    
-            #print(f"Server sent learning rate to client {k}: {lr_clients[k]}")
-            updated_state = client.update(global_state, lr_clients[k])         
-            local_states.append(updated_state)
+                client.model.load_state_dict(global_state)
+            local_states.append(client.update(global_state))
 
         cfg.logginginfo.LocalUpdate_time = time.time() - local_update_start
 
         ## Global update
         global_update_start = time.time()
-        #server.update(local_states)
-
-        # Ensure lr updated in each round
-        global_state, lr_clients = server.update(local_states)
+        global_state, _ = server.update(local_states)
         cfg["logginginfo"]["GlobalUpdate_time"] = time.time() - global_update_start
 
         ## Global validation

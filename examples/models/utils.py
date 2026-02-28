@@ -9,7 +9,7 @@ def get_model(args):
     if args.model == "CNN":
         model = CNN(args.num_channel, args.num_classes, args.num_pixel)
     elif args.model == "resnet18":
-        model = ResNet18()
+        model = ResNet18(num_classes=getattr(args, "num_classes", 10))
     elif args.model == "resnet18-legacy":
         model = resnet18(args.num_channel, args.num_classes, args.pretrained)
     elif args.model == "LSTM":
